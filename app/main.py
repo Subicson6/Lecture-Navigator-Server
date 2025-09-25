@@ -3,10 +3,35 @@ import sys
 import uuid
 import logging
 from contextvars import ContextVar
+
+# Temporary Python 3.12 compatibility shim for packages that still import
+# MutableMapping/Mapping/Sequence from 'collections' instead of 'collections.abc'.
+# This prevents ImportError during startup if an older 'bson' package is
+# inadvertently installed. Proper fix: uninstall the standalone 'bson' package
+# and rely on pymongo's bundled bson (see notes in README or issue tracker).
+try:
+    import collections  # noqa: F401
+    import collections.abc as _abc  # noqa: F401
+    for _name in ("Mapping", "MutableMapping", "Sequence"):
+        if not hasattr(collections, _name):
+            setattr(collections, _name, getattr(_abc, _name))
+except Exception:
+    # Best-effort shim; do not fail app startup because of this block
+    pass
+
 from fastapi import FastAPI, HTTPException, status, Request, UploadFile, File
 from loguru import logger
 from . import service, db
-from .models import IngestRequest, IngestResponse, SearchRequest, SearchResponse
+from .models import (
+    IngestRequest,
+    IngestResponse,
+    SearchRequest,
+    SearchResponse,
+    QARequest,
+    QAResponse,
+    TranscribeRequest,
+    TranscribeResponse,
+)
 
 
 # ---- Loguru setup (JSON logs with request_id) ----
@@ -62,6 +87,30 @@ async def add_request_id_middleware(request: Request, call_next):
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.post("/transcribe_youtube", response_model=TranscribeResponse)
+def transcribe_youtube(payload: TranscribeRequest):
+    """Fetch transcript via youtube-transcript.io (fallback to local lib) and return segments + full text."""
+    try:
+        video_id, transcript_text, segs = service.transcribe_youtube(payload.youtube_url)
+        segments = [
+            {
+                "text": s.get("text", ""),
+                "t_start": float(s.get("start", 0.0) or 0.0),
+                "t_end": float(s.get("end", 0.0) or 0.0),
+            }
+            for s in segs
+        ]
+        return TranscribeResponse(video_id=video_id, transcript_text=transcript_text, segments=segments)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An unexpected error occurred during transcription.")
 
 
 @app.post("/ingest_video", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
@@ -124,3 +173,19 @@ async def ingest_file(file: UploadFile = File(...)):
         logger.exception("Ingestion (file) failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="An unexpected error occurred during ingestion.")
+
+
+@app.post("/qa_youtube", response_model=QAResponse)
+def qa_youtube(payload: QARequest):
+    """MVP: Provide answer and timestamped YouTube links directly from a URL + question."""
+    try:
+        answer, results = service.qa_from_url(payload.youtube_url, payload.query, payload.k)
+        return QAResponse(answer=answer, results=results)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception:
+        logger.exception("QA from URL failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An unexpected error occurred during QA.")
