@@ -12,8 +12,43 @@ MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "transcripts")
 # --- AI Models ---
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
-LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "gemini-1.5-flash-latest")
+# Align default to test.py base concept
+LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "models/gemini-2.5-flash")
 FORCE_LOCAL_EMBEDDINGS: bool = os.getenv("FORCE_LOCAL_EMBEDDINGS", "false").lower() in {"1", "true"}
 
-# Local fallback model if no API keys are present
-EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+# Default embedding model aligned to test.py base concept
+EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-small-en-v1.5")
+
+# --- External transcript service (youtube-transcript.io) ---
+YOUTUBE_TRANSCRIPT_API_URL: str = os.getenv(
+    "YOUTUBE_TRANSCRIPT_API_URL",
+    "https://www.youtube-transcript.io/api/transcripts",
+)
+
+# Raw value from env; may be either:
+# - The full header value like: "Basic <token>"
+# - Or just the token value: "<token>"
+YOUTUBE_TRANSCRIPT_API_KEY: str = os.getenv("YOUTUBE_TRANSCRIPT_API_KEY", "Basic 68d55ed4172ff538f9e26db8")
+
+
+def _normalize_basic_auth(value: str) -> str:
+    """Return a proper Authorization header value with 'Basic <token>'.
+
+    Accepts either 'Basic <token>' or just '<token>' from env, trims whitespace,
+    and normalizes the prefix to exactly 'Basic '. Returns empty string if input is empty.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    lower = v.lower()
+    if lower.startswith("basic "):
+        token = v.split(None, 1)[1].strip()
+        return f"Basic {token}"
+    if lower.startswith("basic"):
+        token = v[5:].strip()
+        return f"Basic {token}" if token else ""
+    return f"Basic {v}"
+
+
+# Normalized Authorization header value used by HTTP requests
+YOUTUBE_TRANSCRIPT_AUTH_HEADER: str = _normalize_basic_auth(YOUTUBE_TRANSCRIPT_API_KEY)
