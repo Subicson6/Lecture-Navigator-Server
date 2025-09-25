@@ -25,7 +25,8 @@ def init_db():
 
 def ensure_search_indexes():
     """Creates Atlas Search indexes if they don't exist."""
-    if not db or not collection:
+    # Avoid truthiness checks on PyMongo objects (they don't implement bool())
+    if db is None or collection is None:
         return
     try:
         # NOTE: Vector dimensions are hardcoded for the fallback model.
