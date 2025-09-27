@@ -9,6 +9,16 @@ MONGODB_URI: str = os.getenv("MONGODB_URI", "")
 MONGODB_DB: str = os.getenv("MONGODB_DB", "vidseek_db")
 MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "transcripts")
 
+# Vector DB switch: 'mongodb' (default) or 'pinecone'
+VECTOR_DB: str = os.getenv("VECTOR_DB", "mongodb").lower()
+
+# Pinecone settings (used when VECTOR_DB=pincone)
+PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY", "")
+PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "lecturenav-index")
+# Optional: serverless spec for auto-index creation
+PINECONE_CLOUD: str = os.getenv("PINECONE_CLOUD", "aws")  # aws|gcp|azure
+PINECONE_REGION: str = os.getenv("PINECONE_REGION", "us-east-1")
+
 # --- AI Models ---
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
@@ -18,6 +28,13 @@ FORCE_LOCAL_EMBEDDINGS: bool = os.getenv("FORCE_LOCAL_EMBEDDINGS", "false").lowe
 
 # Default embedding model aligned to test.py base concept
 EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-small-en-v1.5")
+
+# --- Latency/quality knobs ---
+# Keep retrieval snappy for UI (<2s target)
+MAX_K: int = int(os.getenv("MAX_K", "3"))
+ENABLE_RERANK: bool = os.getenv("ENABLE_RERANK", "false").lower() in {"1", "true"}
+FAST_MODE: bool = os.getenv("FAST_MODE", "true").lower() in {"1", "true"}
+LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "2.0"))
 
 # --- External transcript service (youtube-transcript.io) ---
 YOUTUBE_TRANSCRIPT_API_URL: str = os.getenv(
