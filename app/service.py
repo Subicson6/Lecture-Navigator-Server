@@ -15,7 +15,6 @@ from llama_index.core.node_parser import SentenceSplitter
 # youtube-transcript-api versions in some environments. We fetch transcripts
 # directly via youtube-transcript-api with a compatibility shim below.
 from llama_index.vector_stores.mongodb import MongoDBAtlasVectorSearch
-from llama_index.vector_stores.pinecone import PineconeVectorStore  # type: ignore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from sentence_transformers import CrossEncoder
 
@@ -99,7 +98,12 @@ def process_and_store_video(youtube_url: str) -> str:
             continue
         start = float(seg.get("start", 0.0) or 0.0)
         duration = seg.get("duration")
-        end = float(seg.get("end") or (start + float(duration or 0.0)))
+        # Ensure a non-zero window; if both end and duration are missing/zero, default to +2s
+        if seg.get("end") is not None:
+            end = float(seg.get("end"))
+        else:
+            dur = float(duration or 0.0)
+            end = start + (dur if dur > 0.0 else 2.0)
         meta = {
             "video_id": video_id,
             "raw_video_id": raw_id,
@@ -110,46 +114,18 @@ def process_and_store_video(youtube_url: str) -> str:
         }
         docs.append(Document(text=text, metadata=meta))
 
-    # 2) Vector store: MongoDB Atlas or Pinecone
-    if config.VECTOR_DB == "pinecone":
-        try:
-            from pinecone import Pinecone as PineconeClient  # type: ignore
-            pc = PineconeClient(api_key=config.PINECONE_API_KEY)
-            index_name = config.PINECONE_INDEX_NAME
-            # Create index if not exists (serverless)
-            existing = {i["name"] for i in pc.list_indexes()}
-            if index_name not in existing:
-                pc.create_index(
-                    name=index_name,
-                    dimension=384,  # must match embedding size
-                    metric="cosine",
-                    spec={
-                        "serverless": {
-                            "cloud": config.PINECONE_CLOUD,
-                            "region": config.PINECONE_REGION,
-                        }
-                    },
-                )
-            vector_store = PineconeVectorStore(
-                pc.Index(index_name),
-                namespace=str(video_id),  # isolate per ingested video
-                text_key="text",
-                metadata_keys=["video_id", "raw_video_id", "source", "t_start", "t_end", "title"],
-            )
-        except Exception as e:
-            raise ConnectionError(f"Failed to init Pinecone: {e}")
-    else:
-        if not config.MONGODB_URI:
-            raise ConnectionError("MONGODB_URI not set.")
-        client = MongoClient(config.MONGODB_URI)
-        vector_store = MongoDBAtlasVectorSearch(
-            mongodb_client=client,
-            db_name=config.MONGODB_DB,
-            collection_name=config.MONGODB_COLLECTION,
-            index_name="hybrid_index",
-            text_key="text",
-            embedding_key="embedding",
-        )
+    # 2) Vector store: MongoDB Atlas only
+    if not config.MONGODB_URI:
+        raise ConnectionError("MONGODB_URI not set.")
+    client = MongoClient(config.MONGODB_URI)
+    vector_store = MongoDBAtlasVectorSearch(
+        mongodb_client=client,
+        db_name=config.MONGODB_DB,
+        collection_name=config.MONGODB_COLLECTION,
+        vector_index_name="hybrid_index",
+        text_key="text",
+        embedding_key="embedding",
+    )
 
     # 3) Storage context
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -229,6 +205,99 @@ def transcribe_youtube(youtube_url: str) -> Tuple[str, str, List[Dict[str, Any]]
     return video_id, transcript_text, segments
 
 
+def purge_video_embeddings(video_id: str) -> int:
+    """Delete all indexed segments for the given video_id from the Mongo collection."""
+    collection = db.get_collection()
+    if collection is None:
+        raise ConnectionError("DB not initialized.")
+    res = collection.delete_many({"metadata.video_id": video_id})
+    return int(getattr(res, "deleted_count", 0))
+
+
+def _index_segments_for_video(video_id: str, raw_id: str, source: str, segments: List[dict]) -> None:
+    """Index provided segments under an existing video_id (used for re-embedding)."""
+    docs: list[Document] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0.0) or 0.0)
+        duration = seg.get("duration")
+        if seg.get("end") is not None:
+            end = float(seg.get("end"))
+        else:
+            dur = float(duration or 0.0)
+            end = start + (dur if dur > 0.0 else 2.0)
+        meta = {
+            "video_id": video_id,
+            "raw_video_id": raw_id,
+            "source": source,
+            "t_start": start,
+            "t_end": end,
+            "title": f"YouTube Video {raw_id}" if source == "youtube" else None,
+        }
+        docs.append(Document(text=text, metadata=meta))
+
+    if not docs:
+        return
+
+    if not config.MONGODB_URI:
+        raise ConnectionError("MONGODB_URI not set.")
+    client = MongoClient(config.MONGODB_URI)
+    vector_store = MongoDBAtlasVectorSearch(
+        mongodb_client=client,
+        db_name=config.MONGODB_DB,
+        collection_name=config.MONGODB_COLLECTION,
+        vector_index_name="hybrid_index",
+        text_key="text",
+        embedding_key="embedding",
+    )
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    VectorStoreIndex.from_documents(
+        docs,
+        storage_context=storage_context,
+        transformations=Settings.transformations,
+    )
+
+
+def reembed_video_by_id(video_id: str) -> str:
+    """Re-embed an already known video using current embedding model and index settings.
+
+    Steps:
+    - Look up raw_id and source from videos collection.
+    - Fetch transcript segments.
+    - Purge existing vectors for this video_id.
+    - Index segments under the same video_id.
+    """
+    vc = db.get_videos_collection()
+    if vc is None:
+        raise ConnectionError("DB not initialized.")
+    vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1, "source": 1})
+    if not vdoc or not vdoc.get("raw_id"):
+        raise ValueError("Unknown video_id or missing raw_id")
+    raw_id = str(vdoc["raw_id"])
+    source = (vdoc.get("source") or "youtube").lower()
+
+    # Fetch segments
+    if source == "youtube":
+        if config.YOUTUBE_TRANSCRIPT_AUTH_HEADER:
+            try:
+                segments = _fetch_transcript_via_api(raw_id)
+            except Exception as e:
+                logging.warning(f"youtube-transcript.io failed during reembed ({e}); falling back")
+                segments = _fetch_youtube_transcript(raw_id, languages=["en"])  # type: ignore
+        else:
+            segments = _fetch_youtube_transcript(raw_id, languages=["en"])  # type: ignore
+    else:
+        # For non-YouTube, we currently do not support fetch by id
+        raise ValueError("Re-embed is currently supported only for YouTube sources")
+
+    # Purge and re-index
+    purge_video_embeddings(video_id)
+    _index_segments_for_video(video_id, raw_id, source, segments)
+    return video_id
+
+
 async def process_and_store_srt(file: UploadFile) -> str:
     """Ingest an uploaded .srt file and index it similarly to YouTube ingestion."""
     if not file.filename or not file.filename.lower().endswith(".srt"):
@@ -267,7 +336,7 @@ async def process_and_store_srt(file: UploadFile) -> str:
         mongodb_client=client,
         db_name=config.MONGODB_DB,
         collection_name=config.MONGODB_COLLECTION,
-        index_name="hybrid_index",
+        vector_index_name="hybrid_index",
         text_key="text",
         embedding_key="embedding",
     )
@@ -281,8 +350,12 @@ async def process_and_store_srt(file: UploadFile) -> str:
     return video_id
 
 
-def perform_hybrid_search(video_id: str, query: str, k: int) -> List[TimestampSearchResult]:
-    """Hybrid search: MongoDB Atlas pipeline or Pinecone similarity with optional re-rank."""
+def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: float | None = None) -> List[TimestampSearchResult]:
+    """Hybrid search using MongoDB Atlas search + embeddings, with optional re-rank.
+
+    If window_seconds is provided, enrich the returned snippets by fetching ~window_seconds of
+    transcript around each top hit and set t_end = t_start + window_seconds for display.
+    """
     if Settings.embed_model is None:
         raise ConnectionError("Embedding model not initialized.")
 
@@ -304,85 +377,64 @@ def perform_hybrid_search(video_id: str, query: str, k: int) -> List[TimestampSe
     except Exception:
         pass
 
-    # Mongo path (existing behavior)
-    if config.VECTOR_DB != "pinecone":
-        collection = db.get_collection()
-        if collection is None:
-            raise ConnectionError("DB not initialized.")
+    # Mongo path only
+    collection = db.get_collection()
+    if collection is None:
+        raise ConnectionError("DB not initialized.")
 
-        query_vector = Settings.embed_model.get_query_embedding(query)
+    query_vector = Settings.embed_model.get_query_embedding(query)
+    pipeline = [
+        {
+            "$search": {
+                "index": "hybrid_index",
+                "knnBeta": {"vector": query_vector, "path": "embedding", "k": max(k * 20, 50)}
+            }
+        },
+        {"$match": {"metadata.video_id": video_id}},
+        {
+            "$project": {
+                "_id": 0,
+                "text": 1,
+                "metadata": 1,
+                "score": {"$meta": "searchScore"},
+            }
+        },
+        {"$limit": max(k * 20, 50)}
+    ]
+    try:
+        raw = list(collection.aggregate(pipeline))
+    except Exception as e:
+        # Fallback for clusters that disallow knnBeta composition: use text-only and post-filter by video_id
+        logging.warning(f"Primary hybrid pipeline failed ({e}); falling back to text-only search.")
         pipeline = [
-            {
-                "$search": {
-                    "index": "hybrid_index",
-                    "compound": {
-                        "should": [
-                            {"text": {"query": query, "path": ["text", "metadata.title"]}},
-                            {"knnBeta": {"vector": query_vector, "path": "embedding", "k": max(k * 20, 50)}},
-                        ],
-                        "filter": [
-                            {"equals": {"path": "metadata.video_id", "value": video_id}}
-                        ],
-                    },
-                }
-            },
-            {
-                "$project": {
-                    "_id": 0,
-                    "text": 1,
-                    "metadata": 1,
-                    "score": {"$meta": "searchScore"},
-                }
-            },
+            {"$search": {"index": "hybrid_index", "text": {"query": query, "path": ["text", "metadata.title"]}}},
+            {"$match": {"metadata.video_id": video_id}},
+            {"$project": {"_id": 0, "text": 1, "metadata": 1, "score": {"$meta": "searchScore"}}},
             {"$limit": max(k * 20, 50)}
         ]
         raw = list(collection.aggregate(pipeline))
-        candidates: List[dict] = []
-        for r in raw:
-            m = r.get("metadata", {}) or {}
-            text = r.get("text", "") or ""
-            # Construct deep link URL when raw_id available
-            ts = float(m.get("t_start", 0.0))
-            url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
-            candidates.append({
-                "title": m.get("title"),
-                "t_start": ts,
-                "t_end": float(m.get("t_end", 0.0)),
-                "snippet": text[:280],
-                "score": float(r.get("score", 0.0)),
-                "url": url_val,
-                "_full_text": text,
-            })
-    else:
-        # Pinecone similarity search using LlamaIndex API
-        try:
-            from pinecone import Pinecone as PineconeClient  # type: ignore
-            pc = PineconeClient(api_key=config.PINECONE_API_KEY)
-            index = pc.Index(config.PINECONE_INDEX_NAME)
-            query_vec = Settings.embed_model.get_query_embedding(query)
-            res = index.query(
-                vector=query_vec,
-                top_k=max(k * 20, 50),
-                include_metadata=True,
-                namespace=str(video_id),
-            )
-            candidates = []
-            for m in res.get("matches", []) or []:
-                md = m.get("metadata", {}) or {}
-                text = md.get("text", "")
-                ts = float(md.get("t_start", 0.0))
-                url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
-                candidates.append({
-                    "title": md.get("title"),
-                    "t_start": ts,
-                    "t_end": float(md.get("t_end", 0.0)),
-                    "snippet": (text or "")[:280],
-                    "score": float(m.get("score", 0.0)),
-                    "url": url_val,
-                    "_full_text": text or "",
-                })
-        except Exception as e:
-            raise ConnectionError(f"Pinecone query failed: {e}")
+    candidates: List[dict] = []
+    for r in raw:
+        m = r.get("metadata", {}) or {}
+        text = r.get("text", "") or ""
+        # Robust snippet: prefer text, but if empty, try minimal placeholder
+        snippet = (text or "").strip() or f"Segment at ~{float(m.get('t_start', 0.0)):.0f}s"
+        # Construct deep link URL when raw_id available
+        ts = float(m.get("t_start", 0.0))
+        te = float(m.get("t_end", 0.0))
+        # Ensure non-zero window in responses
+        if te <= ts:
+            te = ts + 30.0
+        url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
+        candidates.append({
+            "title": m.get("title"),
+            "t_start": ts,
+            "t_end": te,
+            "snippet": snippet[:280],
+            "score": float(r.get("score", 0.0)),
+            "url": url_val,
+            "_full_text": text,
+        })
 
     # Cross-encoder re-ranking
     ce = _get_cross_encoder() if config.ENABLE_RERANK else None
@@ -397,6 +449,25 @@ def perform_hybrid_search(video_id: str, query: str, k: int) -> List[TimestampSe
 
     candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     topk = candidates[:k]
+
+    # Optionally replace snippets with ~window_seconds window text and normalize
+    def _normalize_text(s: str) -> str:
+        s = (s or "").replace("\n", " ")
+        while "  " in s:
+            s = s.replace("  ", " ")
+        return s.strip()
+
+    if window_seconds and window_seconds > 0:
+        for c in topk:
+            try:
+                expanded = _fetch_window_text_mongo(video_id, c["t_start"], window_seconds=float(window_seconds))
+                if expanded.strip():
+                    c["snippet"] = _normalize_text(expanded)[:800]
+                # force a clean  window end for display
+                c["t_end"] = float(c["t_start"]) + float(window_seconds)
+            except Exception:
+                pass
+
     return [TimestampSearchResult(
         t_start=c["t_start"],
         t_end=c["t_end"],
@@ -413,7 +484,8 @@ def _llm_complete(prompt: str) -> str:
     if config.OPENROUTER_API_KEY:
         try:
             url = "https://openrouter.ai/api/v1/chat/completions"
-            model = os.getenv("OPENROUTER_MODEL", config.LLM_MODEL_NAME or "openrouter/google/gemini-2.0-flash-exp")
+            # OpenRouter expects model slugs like "google/gemini-1.5-flash"
+            model = os.getenv("OPENROUTER_MODEL", "google/" + (config.LLM_MODEL_NAME or "gemini-1.5-flash").replace("models/", ""))
             headers = {
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
@@ -466,15 +538,65 @@ def _llm_complete(prompt: str) -> str:
     return "LLM not configured. Unable to provide a summary."
 
 
-def synthesize_answer(query: str, results: List[TimestampSearchResult]) -> str:
-    """Use OpenRouter or Gemini API directly to synthesize an answer from retrieved sources."""
+def _fetch_window_text_mongo(video_id: str, center_s: float, window_seconds: float = 30.0, max_chars: int = 1500) -> str:
+    """Fetch ~window_seconds of transcript text around a center timestamp for a given video.
+
+    Assumes MongoDB Atlas vector store; collects overlapping transcript segments in the window.
+    """
+    try:
+        collection = db.get_collection()
+        if collection is None:
+            return ""
+        half = max(0.0, float(window_seconds) / 2.0)
+        start = max(0.0, float(center_s) - half)
+        end = float(center_s) + half
+        cursor = collection.find(
+            {
+                "metadata.video_id": video_id,
+                # overlap any segment intersecting the window
+                "metadata.t_start": {"$lte": end},
+                "metadata.t_end": {"$gte": start},
+            },
+            {"text": 1, "metadata.t_start": 1, "_id": 0},
+        ).sort("metadata.t_start", 1)
+        parts: list[str] = []
+        total = 0
+        for doc in cursor:
+            t = (doc.get("text") or "").strip()
+            if not t:
+                continue
+            parts.append(t)
+            total += len(t)
+            if total >= max_chars:
+                break
+        return " ".join(parts)[:max_chars]
+    except Exception:
+        return ""
+
+
+def synthesize_answer(query: str, results: List[TimestampSearchResult], video_id: str | None = None, window_seconds: float = 30.0) -> str:
+    """Use OpenRouter or Gemini API to synthesize an answer from retrieved sources.
+
+    If possible, expand each result into ~window_seconds of transcript around its timestamp
+    to provide more context to the LLM.
+    """
+    # If FAST_MODE is on but snippets are empty, fall back to LLM
     if config.FAST_MODE:
-        # Very quick extractive answer: join top snippets, avoid external LLM
-        joined = " ".join([r.snippet for r in results])
-        return joined[:800]
-    context = "\n---\n".join(
-        [f"Timestamp: {r.t_start:.0f}s\nContent: {r.snippet}" for r in results]
-    )
+        joined = " ".join([r.snippet for r in results if (r.snippet or "").strip()])
+        if joined.strip():
+            return joined[:800]
+    # Build context; expand to ~30s windows when possible; if still empty, use a placeholder
+    def _safe(sn: str) -> str:
+        s = (sn or "").strip()
+        return s if s else "[no snippet available]"
+    context_blocks: list[str] = []
+    for r in results:
+        expanded = ""
+        if video_id:
+            expanded = _fetch_window_text_mongo(video_id, r.t_start, window_seconds=window_seconds)
+        use_text = expanded.strip() if expanded.strip() else _safe(r.snippet)
+        context_blocks.append(f"Timestamp: {r.t_start:.0f}s\nContent: {use_text}")
+    context = "\n---\n".join(context_blocks)
 
     prompt = f"""
     User Query: "{query}"
@@ -525,15 +647,15 @@ def _timestamp_url(raw_id: str, seconds: float) -> str:
     return f"https://www.youtube.com/watch?v={raw_id}&t={int(round(seconds))}s"
 
 
-def qa_from_url(youtube_url: str, query: str, k: int) -> tuple[str, List[QASnippet]]:
+def qa_from_url(youtube_url: str, query: str, k: int, window_seconds: float = 30.0) -> tuple[str, List[QASnippet]]:
     """Ingest the URL (idempotent enough for MVP), run hybrid search, build timestamped links, and summarize."""
     raw_id = _extract_raw_youtube_id(youtube_url)
 
     # Ingest (for MVP we always ingest; consider caching in future)
     video_id = process_and_store_video(youtube_url)
 
-    # Search
-    results = perform_hybrid_search(video_id, query, k)
+    # Search (expand snippets to window_seconds for display)
+    results = perform_hybrid_search(video_id, query, k, window_seconds=window_seconds)
 
     # Build links
     enriched: List[QASnippet] = []
@@ -547,8 +669,45 @@ def qa_from_url(youtube_url: str, query: str, k: int) -> tuple[str, List[QASnipp
             url=_timestamp_url(raw_id, r.t_start),
         ))
 
-    # Summarize
-    answer = synthesize_answer(query, results)
+    # Summarize with expanded windows
+    answer = synthesize_answer(query, results, video_id=video_id, window_seconds=window_seconds)
+    return answer, enriched
+
+
+def qa_from_video_id(video_id: str, query: str, k: int, window_seconds: float = 30.0) -> tuple[str, List[QASnippet]]:
+    """Run retrieval on an already ingested video (by video_id) and return timestamped links + summary."""
+    # Lookup raw_id (for deep links) if available
+    raw_id: str | None = None
+    try:
+        vc = db.get_videos_collection()
+        if vc is not None:
+            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1})
+            if vdoc:
+                rid = vdoc.get("raw_id")
+                raw_id = str(rid) if rid is not None else None
+    except Exception:
+        pass
+
+    # Search (expand snippets to window_seconds for display)
+    results = perform_hybrid_search(video_id, query, k, window_seconds=window_seconds)
+
+    # Build links
+    enriched: List[QASnippet] = []
+    for r in results:
+        url = r.url
+        if not url and raw_id:
+            url = _timestamp_url(raw_id, r.t_start)
+        enriched.append(QASnippet(
+            t_start=r.t_start,
+            t_end=r.t_end,
+            title=r.title,
+            snippet=r.snippet,
+            score=r.score,
+            url=url or "",
+        ))
+
+    # Summarize with expanded windows
+    answer = synthesize_answer(query, results, video_id=video_id, window_seconds=window_seconds)
     return answer, enriched
 
 
