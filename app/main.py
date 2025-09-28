@@ -20,6 +20,7 @@ except Exception:
     pass
 
 from fastapi import FastAPI, HTTPException, status, Request, UploadFile, File
+from fastapi.routing import APIRouter
 from loguru import logger
 from . import service, db
 from .models import (
@@ -31,6 +32,7 @@ from .models import (
     QAResponse,
     TranscribeRequest,
     TranscribeResponse,
+    VideosResponse,
 )
 
 
@@ -63,6 +65,7 @@ logger.add(sys.stdout, level="INFO", enqueue=True, backtrace=True, diagnose=Fals
 
 
 app = FastAPI(title="VidSeek API", version="0.2.0")
+api = APIRouter(prefix="/api")
 
 
 @app.on_event("startup")
@@ -90,6 +93,7 @@ def health_check():
 
 
 @app.post("/transcribe_youtube", response_model=TranscribeResponse)
+@api.post("/transcribe_youtube", response_model=TranscribeResponse)
 def transcribe_youtube(payload: TranscribeRequest):
     """Fetch transcript via youtube-transcript.io (fallback to local lib) and return segments + full text."""
     try:
@@ -113,7 +117,31 @@ def transcribe_youtube(payload: TranscribeRequest):
                             detail="An unexpected error occurred during transcription.")
 
 
+# Video catalog for frontend main menu
+@app.get("/videos", response_model=VideosResponse)
+@api.get("/videos", response_model=VideosResponse)
+def list_videos():
+    try:
+        vc = db.get_videos_collection()
+        if vc is None:
+            return VideosResponse(items=[])
+        docs = list(vc.find({}, {"_id": 0}).sort("created_at", -1).limit(100))
+        # Normalize created_at to ISO string
+        for d in docs:
+            ca = d.get("created_at")
+            if ca and not isinstance(ca, str):
+                try:
+                    d["created_at"] = ca.isoformat()
+                except Exception:
+                    d["created_at"] = str(ca)
+        return VideosResponse(items=docs)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("Failed to list videos")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list videos")
+
+
 @app.post("/ingest_video", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
+@api.post("/ingest_video", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
 def ingest_video(payload: IngestRequest):
     """
     Ingests a YouTube video by URL, processes its transcript, and stores it.
@@ -132,6 +160,7 @@ def ingest_video(payload: IngestRequest):
 
 
 @app.post("/search_timestamps", response_model=SearchResponse)
+@api.post("/search_timestamps", response_model=SearchResponse)
 def search_in_video(payload: SearchRequest):
     """
     Searches within a previously ingested video for a query.
@@ -149,7 +178,22 @@ def search_in_video(payload: SearchRequest):
                 results=results,
             )
 
-        answer = service.synthesize_answer_with_gemini(payload.query, results)
+        answer = service.synthesize_answer(payload.query, results)
+        # If any result lacks a URL (non-YouTube source), best-effort enrich via videos mapping
+        try:
+            if any(getattr(r, "url", None) is None for r in results):
+                vc = db.get_videos_collection()
+                if vc is not None:
+                    vdoc = vc.find_one({"video_id": payload.video_id}, {"raw_id": 1, "source": 1})
+                    rid = (vdoc or {}).get("raw_id")
+                    source = (vdoc or {}).get("source")
+                    if rid and (source == "youtube"):
+                        for r in results:
+                            if not getattr(r, "url", None):
+                                ts = int(round(r.t_start))
+                                r.url = f"https://www.youtube.com/watch?v={rid}&t={ts}s"
+        except Exception:
+            pass
         return SearchResponse(answer=answer, results=results)
     except ConnectionError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
@@ -160,6 +204,7 @@ def search_in_video(payload: SearchRequest):
 
 
 @app.post("/ingest_file", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
+@api.post("/ingest_file", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
 async def ingest_file(file: UploadFile = File(...)):
     """Ingest an uploaded .srt file using the same pipeline as YouTube ingestion."""
     try:
@@ -176,10 +221,13 @@ async def ingest_file(file: UploadFile = File(...)):
 
 
 @app.post("/qa_youtube", response_model=QAResponse)
+@api.post("/qa_youtube", response_model=QAResponse)
 def qa_youtube(payload: QARequest):
     """MVP: Provide answer and timestamped YouTube links directly from a URL + question."""
     try:
-        answer, results = service.qa_from_url(payload.youtube_url, payload.query, payload.k)
+        # cap k aggressively in the handler too for latency safety
+        k = max(1, min(int(payload.k or 3), int(service.config.MAX_K)))
+        answer, results = service.qa_from_url(payload.youtube_url, payload.query, k)
         return QAResponse(answer=answer, results=results)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -189,3 +237,6 @@ def qa_youtube(payload: QARequest):
         logger.exception("QA from URL failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="An unexpected error occurred during QA.")
+
+# Mount /api router for frontend proxy compatibility
+app.include_router(api)

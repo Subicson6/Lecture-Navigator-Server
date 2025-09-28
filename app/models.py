@@ -1,6 +1,6 @@
 # app/models.py
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class IngestRequest(BaseModel):
     youtube_url: str
@@ -14,6 +14,8 @@ class TimestampSearchResult(BaseModel):
     title: str | None = None
     snippet: str
     score: float
+    # Deep link to the timestamp (e.g., YouTube watch URL with &t= param)
+    url: Optional[str] = None
 
 class SearchResponse(BaseModel):
     results: List[TimestampSearchResult]
@@ -61,3 +63,18 @@ class QASnippet(BaseModel):
 class QAResponse(BaseModel):
     answer: str
     results: List[QASnippet]
+
+
+# --- Video catalog for frontend main menu ---
+class VideoMeta(BaseModel):
+    video_id: str
+    raw_id: str
+    source: str
+    url: str
+    title: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    created_at: Optional[str] = None  # ISO timestamp
+
+
+class VideosResponse(BaseModel):
+    items: List[VideoMeta]

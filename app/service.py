@@ -15,8 +15,8 @@ from llama_index.core.node_parser import SentenceSplitter
 # youtube-transcript-api versions in some environments. We fetch transcripts
 # directly via youtube-transcript-api with a compatibility shim below.
 from llama_index.vector_stores.mongodb import MongoDBAtlasVectorSearch
+from llama_index.vector_stores.pinecone import PineconeVectorStore  # type: ignore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.gemini import Gemini
 from sentence_transformers import CrossEncoder
 
 from . import config, db
@@ -24,32 +24,15 @@ from .models import TimestampSearchResult, QASnippet
 
 
 def initialize_models() -> None:
-    """Configure LlamaIndex global Settings with LLM + embedding + node parser."""
+    """Configure embeddings and parsing. LLM is handled via direct providers (OpenRouter/Gemini)."""
     # Embedding model (HuggingFace local or CPU/GPU backed)
     Settings.embed_model = HuggingFaceEmbedding(model_name=config.EMBEDDING_MODEL_NAME)
     logging.info(f"Embedding model configured: {config.EMBEDDING_MODEL_NAME}")
 
-    # LLM preference: GoogleGenAI (as in test.py), fallback to Gemini client
-    if config.GOOGLE_API_KEY:
-        try:
-            from llama_index.llms.google_genai import GoogleGenAI  # type: ignore
-            Settings.llm = GoogleGenAI(
-                model=config.LLM_MODEL_NAME,
-                api_key=config.GOOGLE_API_KEY,
-                temperature=0,
-            )
-            logging.info(f"Google GenAI LLM configured: {config.LLM_MODEL_NAME}")
-        except Exception as e:
-            logging.warning(f"Failed to init GoogleGenAI ({e}), falling back to Gemini")
-            try:
-                Settings.llm = Gemini(model=config.LLM_MODEL_NAME, api_key=config.GOOGLE_API_KEY)
-                logging.info(f"Gemini LLM configured: {config.LLM_MODEL_NAME}")
-            except Exception as e2:
-                logging.error(f"Failed to init Gemini as well ({e2}). LLM disabled.")
-                Settings.llm = None
-    else:
-        Settings.llm = None
-        logging.warning("GOOGLE_API_KEY not set. LLM features will be disabled.")
+    # We do not initialize a LlamaIndex LLM. Answer synthesis uses direct OpenRouter/Gemini clients.
+    Settings.llm = None
+    if not (config.OPENROUTER_API_KEY or config.GOOGLE_API_KEY):
+        logging.warning("No OPENROUTER_API_KEY or GOOGLE_API_KEY set. LLM features will be disabled.")
 
     # Default chunking
     Settings.transformations = [SentenceSplitter(chunk_size=512, chunk_overlap=50)]
@@ -83,6 +66,17 @@ def process_and_store_video(youtube_url: str) -> str:
         raw_id = youtube_url.split("youtu.be/")[1].split("?")[0]
     else:
         raise ValueError("Invalid YouTube URL format.")
+    
+    # Idempotent ingest: reuse existing video if present
+    vc = db.get_videos_collection()
+    video_id = None
+    if vc is not None:
+        try:
+            found = vc.find_one({"raw_id": raw_id}, {"video_id": 1})
+            if found and found.get("video_id"):
+                return str(found["video_id"])  # already ingested
+        except Exception:
+            pass
 
     video_id = str(uuid.uuid4())
 
@@ -116,18 +110,46 @@ def process_and_store_video(youtube_url: str) -> str:
         }
         docs.append(Document(text=text, metadata=meta))
 
-    # 2) Vector store (MongoDB Atlas Vector Search)
-    if not config.MONGODB_URI:
-        raise ConnectionError("MONGODB_URI not set.")
-    client = MongoClient(config.MONGODB_URI)
-    vector_store = MongoDBAtlasVectorSearch(
-        mongodb_client=client,
-        db_name=config.MONGODB_DB,
-        collection_name=config.MONGODB_COLLECTION,
-        index_name="hybrid_index",
-        text_key="text",
-        embedding_key="embedding",
-    )
+    # 2) Vector store: MongoDB Atlas or Pinecone
+    if config.VECTOR_DB == "pinecone":
+        try:
+            from pinecone import Pinecone as PineconeClient  # type: ignore
+            pc = PineconeClient(api_key=config.PINECONE_API_KEY)
+            index_name = config.PINECONE_INDEX_NAME
+            # Create index if not exists (serverless)
+            existing = {i["name"] for i in pc.list_indexes()}
+            if index_name not in existing:
+                pc.create_index(
+                    name=index_name,
+                    dimension=384,  # must match embedding size
+                    metric="cosine",
+                    spec={
+                        "serverless": {
+                            "cloud": config.PINECONE_CLOUD,
+                            "region": config.PINECONE_REGION,
+                        }
+                    },
+                )
+            vector_store = PineconeVectorStore(
+                pc.Index(index_name),
+                namespace=str(video_id),  # isolate per ingested video
+                text_key="text",
+                metadata_keys=["video_id", "raw_video_id", "source", "t_start", "t_end", "title"],
+            )
+        except Exception as e:
+            raise ConnectionError(f"Failed to init Pinecone: {e}")
+    else:
+        if not config.MONGODB_URI:
+            raise ConnectionError("MONGODB_URI not set.")
+        client = MongoClient(config.MONGODB_URI)
+        vector_store = MongoDBAtlasVectorSearch(
+            mongodb_client=client,
+            db_name=config.MONGODB_DB,
+            collection_name=config.MONGODB_COLLECTION,
+            index_name="hybrid_index",
+            text_key="text",
+            embedding_key="embedding",
+        )
 
     # 3) Storage context
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -140,6 +162,43 @@ def process_and_store_video(youtube_url: str) -> str:
         storage_context=storage_context,
         transformations=Settings.transformations,
     )
+
+    # Persist ingest mapping for reuse
+    if vc is not None:
+        try:
+            # Optionally fetch basic metadata from YouTube oEmbed for title/thumbnail
+            title = None
+            thumbnail = None
+            try:
+                oembed = requests.get(
+                    "https://www.youtube.com/oembed",
+                    params={"url": f"https://www.youtube.com/watch?v={raw_id}", "format": "json"},
+                    timeout=2.0,
+                )
+                if oembed.ok:
+                    j = oembed.json()
+                    title = j.get("title")
+                    thumbnail = j.get("thumbnail_url")
+            except Exception:
+                pass
+
+            vc.update_one(
+                {"raw_id": raw_id},
+                {
+                    "$set": {
+                        "raw_id": raw_id,
+                        "video_id": video_id,
+                        "source": "youtube",
+                        "url": f"https://www.youtube.com/watch?v={raw_id}",
+                        "title": title,
+                        "thumbnail_url": thumbnail,
+                    },
+                    "$setOnInsert": {"created_at": __import__("datetime").datetime.utcnow()},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
 
     return video_id
 
@@ -223,57 +282,110 @@ async def process_and_store_srt(file: UploadFile) -> str:
 
 
 def perform_hybrid_search(video_id: str, query: str, k: int) -> List[TimestampSearchResult]:
-    """True hybrid search using Atlas $search compound (text + knn) with re-ranking."""
-    collection = db.get_collection()
-    # Avoid truthiness tests on PyMongo objects
-    if collection is None or Settings.embed_model is None:
-        raise ConnectionError("DB or embedding model not initialized.")
+    """Hybrid search: MongoDB Atlas pipeline or Pinecone similarity with optional re-rank."""
+    if Settings.embed_model is None:
+        raise ConnectionError("Embedding model not initialized.")
 
-    query_vector = Settings.embed_model.get_query_embedding(query)
+    # Enforce low k to keep latency <2s
+    try:
+        k = max(1, min(int(k), int(config.MAX_K)))
+    except Exception:
+        k = config.MAX_K
 
-    pipeline = [
-        {
-            "$search": {
-                "index": "hybrid_index",
-                "compound": {
-                    "should": [
-                        {"text": {"query": query, "path": ["text", "metadata.title"]}},
-                        {"knnBeta": {"vector": query_vector, "path": "embedding", "k": max(k * 20, 50)}},
-                    ],
-                    "filter": [
-                        {"equals": {"path": "metadata.video_id", "value": video_id}}
-                    ],
-                },
-            }
-        },
-        {
-            "$project": {
-                "_id": 0,
-                "text": 1,
-                "metadata": 1,
-                "score": {"$meta": "searchScore"},
-            }
-        },
-        {"$limit": max(k * 20, 50)}
-    ]
-    raw = list(collection.aggregate(pipeline))
+    # Fetch raw_id for URL building (if available)
+    raw_id: str | None = None
+    try:
+        vc = db.get_videos_collection()
+        if vc is not None:
+            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1})
+            if vdoc:
+                rid = vdoc.get("raw_id")
+                raw_id = str(rid) if rid is not None else None
+    except Exception:
+        pass
 
-    # Build candidates
-    candidates: List[dict] = []
-    for r in raw:
-        m = r.get("metadata", {}) or {}
-        text = r.get("text", "") or ""
-        candidates.append({
-            "title": m.get("title"),
-            "t_start": float(m.get("t_start", 0.0)),
-            "t_end": float(m.get("t_end", 0.0)),
-            "snippet": text[:280],
-            "score": float(r.get("score", 0.0)),
-            "_full_text": text,  # keep for re-ranker scoring
-        })
+    # Mongo path (existing behavior)
+    if config.VECTOR_DB != "pinecone":
+        collection = db.get_collection()
+        if collection is None:
+            raise ConnectionError("DB not initialized.")
+
+        query_vector = Settings.embed_model.get_query_embedding(query)
+        pipeline = [
+            {
+                "$search": {
+                    "index": "hybrid_index",
+                    "compound": {
+                        "should": [
+                            {"text": {"query": query, "path": ["text", "metadata.title"]}},
+                            {"knnBeta": {"vector": query_vector, "path": "embedding", "k": max(k * 20, 50)}},
+                        ],
+                        "filter": [
+                            {"equals": {"path": "metadata.video_id", "value": video_id}}
+                        ],
+                    },
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "text": 1,
+                    "metadata": 1,
+                    "score": {"$meta": "searchScore"},
+                }
+            },
+            {"$limit": max(k * 20, 50)}
+        ]
+        raw = list(collection.aggregate(pipeline))
+        candidates: List[dict] = []
+        for r in raw:
+            m = r.get("metadata", {}) or {}
+            text = r.get("text", "") or ""
+            # Construct deep link URL when raw_id available
+            ts = float(m.get("t_start", 0.0))
+            url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
+            candidates.append({
+                "title": m.get("title"),
+                "t_start": ts,
+                "t_end": float(m.get("t_end", 0.0)),
+                "snippet": text[:280],
+                "score": float(r.get("score", 0.0)),
+                "url": url_val,
+                "_full_text": text,
+            })
+    else:
+        # Pinecone similarity search using LlamaIndex API
+        try:
+            from pinecone import Pinecone as PineconeClient  # type: ignore
+            pc = PineconeClient(api_key=config.PINECONE_API_KEY)
+            index = pc.Index(config.PINECONE_INDEX_NAME)
+            query_vec = Settings.embed_model.get_query_embedding(query)
+            res = index.query(
+                vector=query_vec,
+                top_k=max(k * 20, 50),
+                include_metadata=True,
+                namespace=str(video_id),
+            )
+            candidates = []
+            for m in res.get("matches", []) or []:
+                md = m.get("metadata", {}) or {}
+                text = md.get("text", "")
+                ts = float(md.get("t_start", 0.0))
+                url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
+                candidates.append({
+                    "title": md.get("title"),
+                    "t_start": ts,
+                    "t_end": float(md.get("t_end", 0.0)),
+                    "snippet": (text or "")[:280],
+                    "score": float(m.get("score", 0.0)),
+                    "url": url_val,
+                    "_full_text": text or "",
+                })
+        except Exception as e:
+            raise ConnectionError(f"Pinecone query failed: {e}")
 
     # Cross-encoder re-ranking
-    ce = _get_cross_encoder()
+    ce = _get_cross_encoder() if config.ENABLE_RERANK else None
     if ce and candidates:
         pairs = [(query, c["_full_text"]) for c in candidates]
         try:
@@ -281,26 +393,85 @@ def perform_hybrid_search(video_id: str, query: str, k: int) -> List[TimestampSe
             for c, s in zip(candidates, ce_scores):
                 c["score"] = float(s)
         except Exception as e:
-            logging.warning(f"Cross-encoder scoring failed, falling back to searchScore: {e}")
+            logging.warning(f"Cross-encoder scoring failed, falling back to base scores: {e}")
 
-    # Sort and trim top-k
     candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     topk = candidates[:k]
-
     return [TimestampSearchResult(
         t_start=c["t_start"],
         t_end=c["t_end"],
         title=c.get("title"),
         snippet=c["snippet"],
         score=c["score"],
+        url=c.get("url"),
     ) for c in topk]
 
 
-def synthesize_answer_with_gemini(query: str, results: List[TimestampSearchResult]) -> str:
-    """Use LlamaIndex LLM (Gemini) to synthesize an answer from retrieved sources."""
-    if not Settings.llm:
-        return "LLM not configured. Unable to provide a summary."
+def _llm_complete(prompt: str) -> str:
+    """Call OpenRouter (preferred) or Gemini API directly and return text."""
+    # 1) OpenRouter (OpenAI-compatible chat API)
+    if config.OPENROUTER_API_KEY:
+        try:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            model = os.getenv("OPENROUTER_MODEL", config.LLM_MODEL_NAME or "openrouter/google/gemini-2.0-flash-exp")
+            headers = {
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You summarize transcript excerpts into a single, concise answer."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+                "timeout": config.LLM_TIMEOUT_SECONDS,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=config.LLM_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+            return (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as e:
+            logging.error(f"OpenRouter call failed: {e}")
 
+    # 2) Google Gemini via google-generativeai
+    if config.GOOGLE_API_KEY:
+        try:
+            import google.generativeai as genai  # type: ignore
+
+            genai.configure(api_key=config.GOOGLE_API_KEY)
+            model_name = (config.LLM_MODEL_NAME or "gemini-1.5-flash").replace("models/", "")
+            model = genai.GenerativeModel(model_name)
+            resp = model.generate_content(prompt, request_options={"timeout": config.LLM_TIMEOUT_SECONDS})
+            text = getattr(resp, "text", None)
+            if text:
+                return text.strip()
+            # Fallback: concatenate parts
+            parts = getattr(resp, "candidates", None) or []
+            if parts:
+                return str(parts[0]).strip()
+        except Exception as e:
+            logging.error(f"Gemini call failed: {e}")
+
+    return "LLM not configured. Unable to provide a summary."
+
+
+def synthesize_answer(query: str, results: List[TimestampSearchResult]) -> str:
+    """Use OpenRouter or Gemini API directly to synthesize an answer from retrieved sources."""
+    if config.FAST_MODE:
+        # Very quick extractive answer: join top snippets, avoid external LLM
+        joined = " ".join([r.snippet for r in results])
+        return joined[:800]
     context = "\n---\n".join(
         [f"Timestamp: {r.t_start:.0f}s\nContent: {r.snippet}" for r in results]
     )
@@ -310,7 +481,7 @@ def synthesize_answer_with_gemini(query: str, results: List[TimestampSearchResul
 
     Based on the following video transcript excerpts, provide a concise, direct answer to the user's query.
     Do not add any preamble like "Based on the transcript...".
-    If the context is insufficient to answer the query, state that you cannot find the answer in the provided text.
+    If the context is insufficient to answer the query, say: "I cannot find the answer in the provided text."
 
     Context:
     {context}
@@ -319,10 +490,9 @@ def synthesize_answer_with_gemini(query: str, results: List[TimestampSearchResul
     """
 
     try:
-        response = Settings.llm.complete(prompt)
-        return getattr(response, "text", str(response)).strip()
+        return _llm_complete(prompt)
     except Exception as e:
-        logging.error(f"Error calling LLM: {e}")
+        logging.error(f"Error generating answer: {e}")
         return "There was an error generating the answer."
 
 
@@ -378,7 +548,7 @@ def qa_from_url(youtube_url: str, query: str, k: int) -> tuple[str, List[QASnipp
         ))
 
     # Summarize
-    answer = synthesize_answer_with_gemini(query, results)
+    answer = synthesize_answer(query, results)
     return answer, enriched
 
 
