@@ -49,7 +49,8 @@ def ensure_search_indexes():
 
         # 2) Create index with recommended mapping
         # NOTE: dims should match your embedding model. BGE-small = 384; adjust if needed.
-        vector_dims = 384
+        from .config import EMBEDDING_DIM
+        vector_dims = EMBEDDING_DIM
         definition = {
             "mappings": {
                 "dynamic": False,
