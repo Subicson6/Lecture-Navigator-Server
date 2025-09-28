@@ -30,6 +30,7 @@ from .models import (
     SearchResponse,
     QARequest,
     QAResponse,
+    QAByIdRequest,
     TranscribeRequest,
     TranscribeResponse,
     VideosResponse,
@@ -166,7 +167,7 @@ def search_in_video(payload: SearchRequest):
     Searches within a previously ingested video for a query.
     """
     try:
-        results = service.perform_hybrid_search(payload.video_id, payload.query, payload.k)
+        results = service.perform_hybrid_search(payload.video_id, payload.query, payload.k, window_seconds=float(getattr(payload, "window_seconds", 30.0) or 30.0))
         if not results:
             return SearchResponse(answer="Could not find any relevant information in the video for your query.",
                                   results=[])
@@ -178,7 +179,8 @@ def search_in_video(payload: SearchRequest):
                 results=results,
             )
 
-        answer = service.synthesize_answer(payload.query, results)
+        # Enrich answer with configurable context windows using video_id for better LLM synthesis
+        answer = service.synthesize_answer(payload.query, results, video_id=payload.video_id, window_seconds=float(getattr(payload, "window_seconds", 30.0) or 30.0))
         # If any result lacks a URL (non-YouTube source), best-effort enrich via videos mapping
         try:
             if any(getattr(r, "url", None) is None for r in results):
@@ -227,7 +229,7 @@ def qa_youtube(payload: QARequest):
     try:
         # cap k aggressively in the handler too for latency safety
         k = max(1, min(int(payload.k or 3), int(service.config.MAX_K)))
-        answer, results = service.qa_from_url(payload.youtube_url, payload.query, k)
+        answer, results = service.qa_from_url(payload.youtube_url, payload.query, k, window_seconds=30.0)
         return QAResponse(answer=answer, results=results)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -237,6 +239,54 @@ def qa_youtube(payload: QARequest):
         logger.exception("QA from URL failed")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="An unexpected error occurred during QA.")
+
+
+@app.post("/qa_video", response_model=QAResponse)
+@api.post("/qa_video", response_model=QAResponse)
+def qa_video(payload: QAByIdRequest):
+    """Chat over an already-ingested video by video_id (no re-ingest)."""
+    try:
+        k = max(1, min(int(payload.k or 3), int(service.config.MAX_K)))
+        answer, results = service.qa_from_video_id(payload.video_id, payload.query, k, window_seconds=float(getattr(payload, "window_seconds", 30.0) or 30.0))
+        return QAResponse(answer=answer, results=results)
+    except ConnectionError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception:
+        logger.exception("QA by video_id failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="An unexpected error occurred during QA.")
+
+
+@app.post("/admin/purge_video/{video_id}")
+@api.post("/admin/purge_video/{video_id}")
+def purge_video(video_id: str):
+    """Delete all embeddings/documents for a video_id to prepare for re-ingestion with new dims."""
+    try:
+        deleted = service.purge_video_embeddings(video_id)
+        return {"video_id": video_id, "deleted": deleted}
+    except ConnectionError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception:
+        logger.exception("Purge failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to purge video embeddings.")
+
+
+@app.post("/admin/reembed_video/{video_id}", response_model=IngestResponse)
+@api.post("/admin/reembed_video/{video_id}", response_model=IngestResponse)
+def reembed_video(video_id: str):
+    """Re-embed an existing video using current embedding model/dims; keeps the same video_id."""
+    try:
+        vid = service.reembed_video_by_id(video_id)
+        return IngestResponse(video_id=vid)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except ConnectionError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except Exception:
+        logger.exception("Re-embed failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to re-embed video.")
 
 # Mount /api router for frontend proxy compatibility
 app.include_router(api)
