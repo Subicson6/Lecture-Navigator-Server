@@ -24,7 +24,9 @@ class SearchResponse(BaseModel):
 class SearchRequest(BaseModel):
     video_id: str
     query: str
-    k: int = 4
+    k: int = 3
+    # Optional expansion window for LLM context per hit (seconds)
+    window_seconds: float = 30.0
 
 
 # --- Transcription (API-aligned) ---
@@ -63,6 +65,14 @@ class QASnippet(BaseModel):
 class QAResponse(BaseModel):
     answer: str
     results: List[QASnippet]
+
+
+# --- Video-id based QA ---
+class QAByIdRequest(BaseModel):
+    video_id: str
+    query: str
+    k: int = 3
+    window_seconds: float = 30.0
 
 
 # --- Video catalog for frontend main menu ---
