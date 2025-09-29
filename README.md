@@ -1,10 +1,4 @@
-You got it\! I've updated the heading and incorporated a flowchart to visually represent the core data ingestion and querying process.
-
-Here's the revised `README.md` content:
-
------
-
-# Lecture Navigator Server (VidSeek API)
+Lecture Navigator Server (VidSeek API)
 
 [](https://www.python.org/)
 [](https://fastapi.tiangolo.com/)
