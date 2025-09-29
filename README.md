@@ -1,8 +1,6 @@
 
 # Lecture Navigator Server (VidSeek API)
-=======
-Lecture Navigator Server (VidSeek API)
->>>>>>> origin/master
+
 
 FastAPI service for ingesting YouTube video transcripts and enabling semantic search with a Retrieval-Augmented Generation (RAG) pipeline. The app uses LlamaIndex for ingestion (chunking + embedding), MongoDB Atlas Vector Search for storage/retrieval, and Gemini as the LLM for answer synthesis. Structured JSON logs are emitted via Loguru with a per-request request_id.
 
@@ -164,4 +162,4 @@ Response (example):
 | `POST` | `/api/admin/purge_video/{video_id}` | **Admin**: Deletes all data associated with a specific `video_id`.             |
 | `POST` | `/api/admin/reembed_video/{video_id}` | **Admin**: Re-generates embeddings for a video using current model settings. |
 | `GET`  | `/health`                           | A simple health check endpoint.                                                |
->>>>>>> origin/master
+
