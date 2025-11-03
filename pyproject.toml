@@ -33,3 +33,4 @@ chromadb = "^0.5.5"
 faiss-cpu = { version = "1.8.0.post1", markers = "platform_system != 'Windows'" }
 llama-index-vector-stores-pinecone = "^0.4.2"
 pinecone-client = "^5.0.0"
+llama-index-embeddings-huggingface = "^0.3.1"

@@ -1,16 +1,27 @@
 import uuid
 import logging
 import os
+import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 import requests
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry  # type: ignore
+except Exception:  # pragma: no cover - fallback if urllib3 location changes
+    try:
+        # Older import path
+        from urllib3.util import Retry  # type: ignore
+    except Exception:  # If unavailable, we will rely on manual retries
+        Retry = None  # type: ignore
 
 from fastapi import UploadFile
 from pymongo import MongoClient
 
 from llama_index.core import Settings, VectorStoreIndex, StorageContext, SimpleDirectoryReader
 from llama_index.core.schema import Document
-from llama_index.core.node_parser import SentenceSplitter
+# Removed: from llama_index.core.node_parser import SentenceSplitter # No longer needed for default transformations
 # NOTE: Avoid llama_index YoutubeTranscriptReader due to incompatibilities with
 # youtube-transcript-api versions in some environments. We fetch transcripts
 # directly via youtube-transcript-api with a compatibility shim below.
@@ -34,7 +45,10 @@ def initialize_models() -> None:
         logging.warning("No OPENROUTER_API_KEY or GOOGLE_API_KEY set. LLM features will be disabled.")
 
     # Default chunking
-    Settings.transformations = [SentenceSplitter(chunk_size=512, chunk_overlap=50)]
+    # --- MODIFICATION START (1/3) ---
+    # Disable default LlamaIndex SentenceSplitter, as we're using custom time-based chunking.
+    Settings.transformations = []
+    # --- MODIFICATION END (1/3) ---
 
     # Cross-encoder for re-ranking (lazy init in getter)
     logging.info("Service models initialized.")
@@ -56,65 +70,188 @@ def _get_cross_encoder() -> CrossEncoder | None:
     return _cross_encoder
 
 
+# --- MODIFICATION START (2/3) ---
+# New function for time-based chunking
+def chunk_by_time(
+        segments: List[dict],
+        video_id: str,
+        raw_id: str,
+        title: str,
+        source: str = "youtube",
+        window_seconds: float = 30.0,
+        overlap_seconds: float = 5.0,
+) -> List[Document]:
+    """
+    Chunks transcript segments into fixed-size time windows with overlap.
+
+    Args:
+        segments: The list of raw transcript segments from the API.
+        video_id: The unique ID for the video.
+        raw_id: The original YouTube video ID.
+        title: The video title.
+        source: The source of the video (e.g., 'youtube').
+        window_seconds: The duration of each chunk in seconds.
+        overlap_seconds: The duration of the overlap between consecutive chunks.
+
+    Returns:
+        A list of LlamaIndex Document objects representing the time-based chunks.
+    """
+    if not segments:
+        return []
+
+    # Calculate the effective video duration based on the last segment
+    video_duration = 0.0
+    if segments:
+        last_seg = segments[-1]
+        video_duration = float(last_seg.get("end", last_seg.get("start", 0.0) + last_seg.get("duration", 0.0)))
+
+    time_chunks: List[Document] = []
+    current_time = 0.0
+    step = window_seconds - overlap_seconds
+
+    # Ensure step is positive to avoid infinite loop if window_seconds <= overlap_seconds
+    if step <= 0:
+        logging.warning(
+            f"Window size ({window_seconds}s) is not greater than overlap ({overlap_seconds}s). Setting step to window_seconds.")
+        step = window_seconds  # Fallback to no overlap if misconfigured
+
+    while current_time < video_duration + overlap_seconds:  # Loop slightly beyond to catch last few seconds
+        window_start = max(0.0, current_time)  # Ensure window_start is not negative
+        window_end = current_time + window_seconds
+
+        # Find all segments that overlap with the current time window
+        texts_in_window = []
+        for seg in segments:
+            seg_start = float(seg.get("start", 0.0))
+            seg_end = float(seg.get("end", seg_start + seg.get("duration", 0.0)))
+
+            # Check for any overlap between the segment and the window
+            if seg_start < window_end and seg_end > window_start:
+                texts_in_window.append(seg.get("text", "").strip())
+
+        # If there's content, create a document for this time chunk
+        if texts_in_window:
+            chunk_text = " ".join(texts_in_window).strip()
+
+            if chunk_text:  # Only create a chunk if there's actual text
+                # Create the metadata for this specific time window
+                meta = {
+                    "video_id": video_id,
+                    "raw_video_id": raw_id,
+                    "source": source,
+                    "t_start": window_start,
+                    "t_end": window_end,
+                    "title": title,
+                }
+                time_chunks.append(Document(text=chunk_text, metadata=meta))
+
+        # Move to the next window start time
+        current_time += step
+
+    return time_chunks
+
+
+# --- MODIFICATION END (2/3) ---
+
+
 def process_and_store_video(youtube_url: str) -> str:
-    """Ingest a YouTube video into MongoDB Atlas vector store via LlamaIndex."""
-    # Extract raw YouTube ID
+    """Ingest a YouTube video into MongoDB Atlas vector store via LlamaIndex with timing logs."""
+    import time
+
+    total_start = time.perf_counter()
+
+    # ----------------------------
+    # 1️⃣ Extract raw YouTube ID
+    # ----------------------------
+    id_start = time.perf_counter()
     if "watch?v=" in youtube_url:
         raw_id = youtube_url.split("watch?v=")[1].split("&")[0]
     elif "youtu.be/" in youtube_url:
         raw_id = youtube_url.split("youtu.be/")[1].split("?")[0]
     else:
         raise ValueError("Invalid YouTube URL format.")
-    
-    # Idempotent ingest: reuse existing video if present
+    id_end = time.perf_counter()
+    logging.info(f"[TIMING] Extract YouTube ID: {id_end - id_start:.2f}s")
+
+    # ----------------------------
+    # 2️⃣ Idempotent ingest check
+    # ----------------------------
     vc = db.get_videos_collection()
     video_id = None
+    # -------------------
+    # MODIFICATION 1 of 4
+    # -------------------
+    # Changed `if vc:` to `if vc is not None:`
     if vc is not None:
         try:
             found = vc.find_one({"raw_id": raw_id}, {"video_id": 1})
             if found and found.get("video_id"):
-                return str(found["video_id"])  # already ingested
+                logging.info("Video already ingested. Reusing video_id.")
+                return str(found["video_id"])
         except Exception:
             pass
-
     video_id = str(uuid.uuid4())
 
-    # 1) Fetch transcript segments using youtube-transcript.io when available, else fallback
+    # ----------------------------
+    # 3️⃣ Fetch transcript segments
+    # ----------------------------
+    t_start = time.perf_counter()
     segments: List[dict]
-    if config.YOUTUBE_TRANSCRIPT_AUTH_HEADER:
-        try:
-            segments = _fetch_transcript_via_api(raw_id)
-        except Exception as e:
-            logging.warning(f"youtube-transcript.io failed ({e}); falling back to youtube_transcript_api")
-            segments = _fetch_youtube_transcript(raw_id, languages=["en"])  # list[dict]
-    else:
-        segments = _fetch_youtube_transcript(raw_id, languages=["en"])  # list[dict]
-
-    # Build Documents, 1 per segment, preserving timestamps for later linking
-    docs: list[Document] = []
-    for seg in segments:
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        start = float(seg.get("start", 0.0) or 0.0)
-        duration = seg.get("duration")
-        # Ensure a non-zero window; if both end and duration are missing/zero, default to +2s
-        if seg.get("end") is not None:
-            end = float(seg.get("end"))
+    try:
+        if config.YOUTUBE_TRANSCRIPT_AUTH_HEADER:
+            try:
+                segments = _fetch_transcript_via_api(raw_id)
+            except Exception as e:
+                logging.warning(f"youtube-transcript.io failed ({e}); falling back to youtube_transcript_api")
+                segments = _fetch_youtube_transcript(raw_id, languages=["en"])
         else:
-            dur = float(duration or 0.0)
-            end = start + (dur if dur > 0.0 else 2.0)
-        meta = {
-            "video_id": video_id,
-            "raw_video_id": raw_id,
-            "source": "youtube",
-            "t_start": start,
-            "t_end": end,
-            "title": f"YouTube Video {raw_id}",
-        }
-        docs.append(Document(text=text, metadata=meta))
+            segments = _fetch_youtube_transcript(raw_id, languages=["en"])
+    except Exception as e:
+        logging.error(f"Transcript fetch failed: {e}")
+        segments = []
+    t_end = time.perf_counter()
+    logging.info(f"[TIMING] Transcript fetch: {t_end - t_start:.2f}s")
 
-    # 2) Vector store: MongoDB Atlas only
+    # --- MODIFICATION START (3/3) ---
+    # ----------------------------
+    # 4️⃣ Build Time-Based Chunks
+    # ----------------------------
+    d_start = time.perf_counter()
+
+    # Attempt to fetch video title from YouTube oEmbed if not already found.
+    # This ensures a meaningful title for metadata.
+    video_title = f"YouTube Video {raw_id}"
+    try:
+        oembed = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={raw_id}", "format": "json"},
+            timeout=2.0,
+        )
+        if oembed.ok:
+            j = oembed.json()
+            video_title = j.get("title", video_title)
+    except Exception as e:
+        logging.warning(f"Could not fetch YouTube oEmbed title for {raw_id}: {e}")
+
+    # Use the new time-based chunking function
+    docs = chunk_by_time(
+        segments=segments,
+        video_id=video_id,
+        raw_id=raw_id,
+        title=video_title,  # Pass the fetched title
+        window_seconds=30.0,  # You can make these configurable via config.py
+        overlap_seconds=5.0,  # You can make these configurable via config.py
+    )
+
+    d_end = time.perf_counter()
+    logging.info(f"[TIMING] Time-based chunking: {d_end - d_start:.2f}s (chunks={len(docs)})")
+
+    # --- MODIFICATION END (3/3) ---
+
+    # ----------------------------
+    # 5️⃣ Vector store embedding
+    # ----------------------------
+    v_start = time.perf_counter()
     if not config.MONGODB_URI:
         raise ConnectionError("MONGODB_URI not set.")
     client = MongoClient(config.MONGODB_URI)
@@ -126,25 +263,28 @@ def process_and_store_video(youtube_url: str) -> str:
         text_key="text",
         embedding_key="embedding",
     )
-
-    # 3) Storage context
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-    # 4) ServiceContext is represented via global Settings (embed_model + transformations)
-
-    # 5) Build index (handles chunking, embedding, storing)
     VectorStoreIndex.from_documents(
-        docs,
+        docs,  # Now 'docs' contains the time-based chunks
         storage_context=storage_context,
-        transformations=Settings.transformations,
+        transformations=Settings.transformations,  # This is now an empty list, so no further splitting
     )
+    v_end = time.perf_counter()
+    logging.info(f"[TIMING] Embedding & MongoDB store: {v_end - v_start:.2f}s")
 
-    # Persist ingest mapping for reuse
+    # ----------------------------
+    # 6️⃣ Persist metadata
+    # ----------------------------
+    m_start = time.perf_counter()
+    # -------------------
+    # MODIFICATION 2 of 4
+    # -------------------
+    # Changed `if vc:` to `if vc is not None:`
     if vc is not None:
         try:
-            # Optionally fetch basic metadata from YouTube oEmbed for title/thumbnail
-            title = None
-            thumbnail = None
+            # Re-fetch title/thumbnail if not already done during chunking to ensure consistency
+            # or if title could not be fetched during chunking.
+            final_title, thumbnail = video_title, None
             try:
                 oembed = requests.get(
                     "https://www.youtube.com/oembed",
@@ -153,7 +293,7 @@ def process_and_store_video(youtube_url: str) -> str:
                 )
                 if oembed.ok:
                     j = oembed.json()
-                    title = j.get("title")
+                    final_title = j.get("title", final_title)
                     thumbnail = j.get("thumbnail_url")
             except Exception:
                 pass
@@ -166,7 +306,7 @@ def process_and_store_video(youtube_url: str) -> str:
                         "video_id": video_id,
                         "source": "youtube",
                         "url": f"https://www.youtube.com/watch?v={raw_id}",
-                        "title": title,
+                        "title": final_title,
                         "thumbnail_url": thumbnail,
                     },
                     "$setOnInsert": {"created_at": __import__("datetime").datetime.utcnow()},
@@ -175,6 +315,11 @@ def process_and_store_video(youtube_url: str) -> str:
             )
         except Exception:
             pass
+    m_end = time.perf_counter()
+    logging.info(f"[TIMING] Persist metadata: {m_end - m_start:.2f}s")
+
+    total_end = time.perf_counter()
+    logging.info(f"[TIMING] Total ingestion for video_id={video_id}: {total_end - total_start:.2f}s\n")
 
     return video_id
 
@@ -216,27 +361,34 @@ def purge_video_embeddings(video_id: str) -> int:
 
 def _index_segments_for_video(video_id: str, raw_id: str, source: str, segments: List[dict]) -> None:
     """Index provided segments under an existing video_id (used for re-embedding)."""
-    docs: list[Document] = []
-    for seg in segments:
-        text = (seg.get("text") or "").strip()
-        if not text:
-            continue
-        start = float(seg.get("start", 0.0) or 0.0)
-        duration = seg.get("duration")
-        if seg.get("end") is not None:
-            end = float(seg.get("end"))
-        else:
-            dur = float(duration or 0.0)
-            end = start + (dur if dur > 0.0 else 2.0)
-        meta = {
-            "video_id": video_id,
-            "raw_video_id": raw_id,
-            "source": source,
-            "t_start": start,
-            "t_end": end,
-            "title": f"YouTube Video {raw_id}" if source == "youtube" else None,
-        }
-        docs.append(Document(text=text, metadata=meta))
+    # --- MODIFICATION START (Added title for chunking) ---
+    # Attempt to fetch video title from YouTube oEmbed for proper chunking metadata.
+    video_title = f"YouTube Video {raw_id}"
+    if source == "youtube":
+        try:
+            oembed = requests.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={raw_id}", "format": "json"},
+                timeout=2.0,
+            )
+            if oembed.ok:
+                j = oembed.json()
+                video_title = j.get("title", video_title)
+        except Exception as e:
+            logging.warning(f"Could not fetch YouTube oEmbed title for {raw_id} in _index_segments_for_video: {e}")
+    # --- MODIFICATION END ---
+
+    # --- MODIFICATION START (Use time-based chunking here too) ---
+    docs = chunk_by_time(
+        segments=segments,
+        video_id=video_id,
+        raw_id=raw_id,
+        title=video_title,
+        source=source,
+        window_seconds=30.0,
+        overlap_seconds=5.0,
+    )
+    # --- MODIFICATION END ---
 
     if not docs:
         return
@@ -256,7 +408,7 @@ def _index_segments_for_video(video_id: str, raw_id: str, source: str, segments:
     VectorStoreIndex.from_documents(
         docs,
         storage_context=storage_context,
-        transformations=Settings.transformations,
+        transformations=Settings.transformations,  # Now empty
     )
 
 
@@ -315,18 +467,48 @@ async def process_and_store_srt(file: UploadFile) -> str:
 
     # Read via LlamaIndex
     reader = SimpleDirectoryReader(input_files=[str(local_path)])
-    docs = reader.load_data()
-    for d in docs:
-        meta = {**(d.metadata or {})}
-        meta.update({
-            "video_id": video_id,
-            "source": "srt",
-            "title": meta.get("file_name") or file.filename,
-            # Timestamps might not be preserved; default to 0s
-            "t_start": float(meta.get("t_start", 0.0)),
-            "t_end": float(meta.get("t_end", 0.0)),
-        })
-        d.metadata = meta
+    raw_docs = reader.load_data()
+
+    # Extract segments-like structure from raw_docs for time-based chunking
+    srt_segments: List[dict] = []
+    video_title = file.filename  # Use filename as title for SRT
+    total_duration = 0.0
+
+    if raw_docs:
+        # Assuming SimpleDirectoryReader for SRT produces one document per logical block
+        # with metadata.start/end if available, or we'll infer.
+        for i, d in enumerate(raw_docs):
+            text = (d.text or "").strip()
+            if not text:
+                continue
+            # Attempt to extract start/end from metadata if available (e.g., from LlamaIndex's SRT reader)
+            # Otherwise, use a dummy duration if not present for basic processing
+            start_time = float(d.metadata.get("start", 0.0))
+            end_time = float(d.metadata.get("end", start_time + 5.0))  # Default to 5s if end not found
+            duration = end_time - start_time
+            if duration <= 0:  # Ensure positive duration
+                duration = 5.0
+                end_time = start_time + duration
+
+            srt_segments.append({
+                "text": text,
+                "start": start_time,
+                "end": end_time,
+                "duration": duration,
+            })
+            total_duration = max(total_duration, end_time)  # Track max duration
+
+    # --- MODIFICATION START (Use time-based chunking for SRT files too) ---
+    docs = chunk_by_time(
+        segments=srt_segments,  # Use the parsed segments
+        video_id=video_id,
+        raw_id=file.filename,  # Use filename as raw_id for SRT
+        title=video_title,
+        source="srt",
+        window_seconds=30.0,
+        overlap_seconds=5.0,
+    )
+    # --- MODIFICATION END ---
 
     # Vector store
     if not config.MONGODB_URI:
@@ -342,15 +524,39 @@ async def process_and_store_srt(file: UploadFile) -> str:
     )
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     VectorStoreIndex.from_documents(
-        docs,
+        docs,  # Now 'docs' contains the time-based chunks
         storage_context=storage_context,
-        transformations=Settings.transformations,
+        transformations=Settings.transformations,  # This is now an empty list
     )
+
+    # Also persist metadata for SRT files
+    vc = db.get_videos_collection()
+    if vc is not None:
+        try:
+            vc.update_one(
+                {"raw_id": file.filename},  # Use filename as raw_id for SRT files
+                {
+                    "$set": {
+                        "raw_id": file.filename,
+                        "video_id": video_id,
+                        "source": "srt",
+                        "url": None,  # No external URL for uploaded SRT
+                        "title": video_title,
+                        "thumbnail_url": None,
+                        "duration": total_duration,  # Store calculated duration
+                    },
+                    "$setOnInsert": {"created_at": __import__("datetime").datetime.utcnow()},
+                },
+                upsert=True,
+            )
+        except Exception:
+            pass
 
     return video_id
 
 
-def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: float | None = None) -> List[TimestampSearchResult]:
+def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: float | None = None) -> List[
+    TimestampSearchResult]:
     """Hybrid search using MongoDB Atlas search + embeddings, with optional re-rank.
 
     If window_seconds is provided, enrich the returned snippets by fetching ~window_seconds of
@@ -365,15 +571,21 @@ def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: flo
     except Exception:
         k = config.MAX_K
 
-    # Fetch raw_id for URL building (if available)
+    # Fetch raw_id and source for URL building (if available)
     raw_id: str | None = None
+    video_source: str = "unknown"
     try:
         vc = db.get_videos_collection()
         if vc is not None:
-            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1})
-            if vdoc:
+            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1, "source": 1})
+            # -------------------
+            # MODIFICATION 3 of 4
+            # -------------------
+            # Changed `if vdoc:` to `if vdoc is not None:`
+            if vdoc is not None:
                 rid = vdoc.get("raw_id")
                 raw_id = str(rid) if rid is not None else None
+                video_source = str(vdoc.get("source", "unknown"))
     except Exception:
         pass
 
@@ -419,13 +631,19 @@ def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: flo
         text = r.get("text", "") or ""
         # Robust snippet: prefer text, but if empty, try minimal placeholder
         snippet = (text or "").strip() or f"Segment at ~{float(m.get('t_start', 0.0)):.0f}s"
-        # Construct deep link URL when raw_id available
+
+        # Construct deep link URL when raw_id available and source is youtube
         ts = float(m.get("t_start", 0.0))
         te = float(m.get("t_end", 0.0))
-        # Ensure non-zero window in responses
+        # Ensure non-zero window in responses, using the actual chunk end if available
         if te <= ts:
-            te = ts + 30.0
-        url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s" if raw_id else None
+            # If t_end is not meaningful, infer from window_seconds or default
+            te = ts + (window_seconds if window_seconds is not None else 30.0)
+
+        url_val = None
+        if raw_id and video_source == "youtube":
+            url_val = f"https://www.youtube.com/watch?v={raw_id}&t={int(round(ts))}s"
+
         candidates.append({
             "title": m.get("title"),
             "t_start": ts,
@@ -460,11 +678,15 @@ def perform_hybrid_search(video_id: str, query: str, k: int, window_seconds: flo
     if window_seconds and window_seconds > 0:
         for c in topk:
             try:
+                # _fetch_window_text_mongo already considers a window around t_start
                 expanded = _fetch_window_text_mongo(video_id, c["t_start"], window_seconds=float(window_seconds))
                 if expanded.strip():
                     c["snippet"] = _normalize_text(expanded)[:800]
-                # force a clean  window end for display
-                c["t_end"] = float(c["t_start"]) + float(window_seconds)
+                # The t_end for display should reflect the actual chunk's end or expanded window
+                # With time-based chunking, c["t_end"] already holds the window end.
+                # If you specifically want to show a fixed-size window around the start for ALL snippets,
+                # you can uncomment the line below. Otherwise, the chunk's own t_end is often preferred.
+                # c["t_end"] = float(c["t_start"]) + float(window_seconds)
             except Exception:
                 pass
 
@@ -485,11 +707,21 @@ def _llm_complete(prompt: str) -> str:
         try:
             url = "https://openrouter.ai/api/v1/chat/completions"
             # OpenRouter expects model slugs like "google/gemini-1.5-flash"
-            model = os.getenv("OPENROUTER_MODEL", "google/" + (config.LLM_MODEL_NAME or "gemini-1.5-flash").replace("models/", ""))
+            model = os.getenv(
+                "OPENROUTER_MODEL",
+                "google/" + (config.LLM_MODEL_NAME or "gemini-1.5-flash").replace("models/", ""),
+            )
+
             headers = {
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             }
+            # Optional metadata headers recommended by OpenRouter
+            if getattr(config, "OPENROUTER_SITE_URL", ""):
+                headers["HTTP-Referer"] = config.OPENROUTER_SITE_URL
+            if getattr(config, "OPENROUTER_APP_NAME", ""):
+                headers["X-Title"] = config.OPENROUTER_APP_NAME
+
             payload = {
                 "model": model,
                 "messages": [
@@ -502,17 +734,69 @@ def _llm_complete(prompt: str) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "timeout": config.LLM_TIMEOUT_SECONDS,
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=config.LLM_TIMEOUT_SECONDS)
-            resp.raise_for_status()
-            data = resp.json()
-            return (
-                (data.get("choices") or [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
+
+            # Build a session with retry-on-transient failures
+            session = requests.Session()
+            adapter: HTTPAdapter
+            if Retry is not None and int(getattr(config, "LLM_MAX_RETRIES", 0)) > 0:
+                retry = Retry(
+                    total=int(config.LLM_MAX_RETRIES),
+                    read=int(config.LLM_MAX_RETRIES),
+                    connect=int(config.LLM_MAX_RETRIES),
+                    backoff_factor=float(config.LLM_RETRY_BACKOFF),
+                    status_forcelist=[408, 429, 500, 502, 503, 504],
+                    allowed_methods=frozenset(["POST"]),
+                    raise_on_status=False,
+                )
+                adapter = HTTPAdapter(max_retries=retry)
+            else:
+                adapter = HTTPAdapter()
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+
+            # Manual retry loop to also cover read timeouts
+            attempts = int(getattr(config, "LLM_MAX_RETRIES", 0)) + 1
+            last_err: Exception | None = None
+            for i in range(max(1, attempts)):
+                try:
+                    resp = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=(float(config.LLM_CONNECT_TIMEOUT), float(config.LLM_READ_TIMEOUT)),
+                    )
+                    if 200 <= resp.status_code < 300:
+                        data = resp.json()
+                        return (
+                            (data.get("choices") or [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                            .strip()
+                        )
+                    # Retry on specific status codes
+                    if resp.status_code in {408, 429, 500, 502, 503, 504} and i < attempts - 1:
+                        sleep_s = float(config.LLM_RETRY_BACKOFF) * (2 ** i)
+                        time.sleep(min(sleep_s, 5.0))
+                        continue
+                    # Non-retriable HTTP error
+                    resp.raise_for_status()
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as te:
+                    last_err = te
+                    if i < attempts - 1:
+                        sleep_s = float(config.LLM_RETRY_BACKOFF) * (2 ** i)
+                        time.sleep(min(sleep_s, 5.0))
+                        continue
+                    raise
+                except requests.exceptions.RequestException as re:
+                    last_err = re
+                    # For request exceptions that are not retriable, break
+                    raise
+            # If loop exits without return, raise last error if any
+            if last_err:
+                raise last_err
+            # Fallback guard
+            raise RuntimeError("OpenRouter call failed for unknown reasons")
         except Exception as e:
             logging.error(f"OpenRouter call failed: {e}")
 
@@ -524,7 +808,9 @@ def _llm_complete(prompt: str) -> str:
             genai.configure(api_key=config.GOOGLE_API_KEY)
             model_name = (config.LLM_MODEL_NAME or "gemini-1.5-flash").replace("models/", "")
             model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt, request_options={"timeout": config.LLM_TIMEOUT_SECONDS})
+            # Use fine-grained read timeout; SDK does not support separate connect/read, so pass overall
+            overall_timeout = float(getattr(config, "LLM_READ_TIMEOUT", config.LLM_TIMEOUT_SECONDS))
+            resp = model.generate_content(prompt, request_options={"timeout": overall_timeout})
             text = getattr(resp, "text", None)
             if text:
                 return text.strip()
@@ -538,7 +824,8 @@ def _llm_complete(prompt: str) -> str:
     return "LLM not configured. Unable to provide a summary."
 
 
-def _fetch_window_text_mongo(video_id: str, center_s: float, window_seconds: float = 30.0, max_chars: int = 1500) -> str:
+def _fetch_window_text_mongo(video_id: str, center_s: float, window_seconds: float = 30.0,
+                             max_chars: int = 1500) -> str:
     """Fetch ~window_seconds of transcript text around a center timestamp for a given video.
 
     Assumes MongoDB Atlas vector store; collects overlapping transcript segments in the window.
@@ -574,7 +861,8 @@ def _fetch_window_text_mongo(video_id: str, center_s: float, window_seconds: flo
         return ""
 
 
-def synthesize_answer(query: str, results: List[TimestampSearchResult], video_id: str | None = None, window_seconds: float = 30.0) -> str:
+def synthesize_answer(query: str, results: List[TimestampSearchResult], video_id: str | None = None,
+                      window_seconds: float = 30.0) -> str:
     """Use OpenRouter or Gemini API to synthesize an answer from retrieved sources.
 
     If possible, expand each result into ~window_seconds of transcript around its timestamp
@@ -585,15 +873,17 @@ def synthesize_answer(query: str, results: List[TimestampSearchResult], video_id
         joined = " ".join([r.snippet for r in results if (r.snippet or "").strip()])
         if joined.strip():
             return joined[:800]
+
     # Build context; expand to ~30s windows when possible; if still empty, use a placeholder
     def _safe(sn: str) -> str:
         s = (sn or "").strip()
         return s if s else "[no snippet available]"
+
     context_blocks: list[str] = []
     for r in results:
         expanded = ""
         if video_id:
-            expanded = _fetch_window_text_mongo(video_id, r.t_start, window_seconds=window_seconds)
+            expanded = _fetch_window_text_mongo(video_id, r.t_start, window_seconds=float(window_seconds))
         use_text = expanded.strip() if expanded.strip() else _safe(r.snippet)
         context_blocks.append(f"Timestamp: {r.t_start:.0f}s\nContent: {use_text}")
     context = "\n---\n".join(context_blocks)
@@ -639,7 +929,8 @@ def _extract_raw_youtube_id(youtube_url: str) -> str:
         return youtube_url.split("watch?v=")[1].split("&")[0]
     if "youtu.be/" in youtube_url:
         return youtube_url.split("youtu.be/")[1].split("?")[0]
-    raise ValueError("Invalid YouTube URL format.")
+    else:
+        raise ValueError("Invalid YouTube URL format.")
 
 
 def _timestamp_url(raw_id: str, seconds: float) -> str:
@@ -659,14 +950,28 @@ def qa_from_url(youtube_url: str, query: str, k: int, window_seconds: float = 30
 
     # Build links
     enriched: List[QASnippet] = []
+    # Fetch source from DB to correctly build URLs
+    video_source: str = "youtube"  # Assume youtube if raw_id exists
+    try:
+        vc = db.get_videos_collection()
+        if vc is not None:
+            vdoc = vc.find_one({"video_id": video_id}, {"source": 1})
+            if vdoc:
+                video_source = str(vdoc.get("source", "youtube"))
+    except Exception:
+        pass
+
     for r in results:
+        url = r.url
+        if not url and raw_id and video_source == "youtube":
+            url = _timestamp_url(raw_id, r.t_start)
         enriched.append(QASnippet(
             t_start=r.t_start,
             t_end=r.t_end,
             title=r.title,
             snippet=r.snippet,
             score=r.score,
-            url=_timestamp_url(raw_id, r.t_start),
+            url=url or "",
         ))
 
     # Summarize with expanded windows
@@ -676,15 +981,21 @@ def qa_from_url(youtube_url: str, query: str, k: int, window_seconds: float = 30
 
 def qa_from_video_id(video_id: str, query: str, k: int, window_seconds: float = 30.0) -> tuple[str, List[QASnippet]]:
     """Run retrieval on an already ingested video (by video_id) and return timestamped links + summary."""
-    # Lookup raw_id (for deep links) if available
+    # Lookup raw_id and source (for deep links) if available
     raw_id: str | None = None
+    video_source: str = "unknown"
     try:
         vc = db.get_videos_collection()
         if vc is not None:
-            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1})
-            if vdoc:
+            vdoc = vc.find_one({"video_id": video_id}, {"raw_id": 1, "source": 1})
+            # -------------------
+            # MODIFICATION 4 of 4
+            # -------------------
+            # Changed `if vdoc:` to `if vdoc is not None:`
+            if vdoc is not None:
                 rid = vdoc.get("raw_id")
                 raw_id = str(rid) if rid is not None else None
+                video_source = str(vdoc.get("source", "unknown"))
     except Exception:
         pass
 
@@ -695,7 +1006,7 @@ def qa_from_video_id(video_id: str, query: str, k: int, window_seconds: float = 
     enriched: List[QASnippet] = []
     for r in results:
         url = r.url
-        if not url and raw_id:
+        if not url and raw_id and video_source == "youtube":  # Only create YouTube URLs if source is YouTube
             url = _timestamp_url(raw_id, r.t_start)
         enriched.append(QASnippet(
             t_start=r.t_start,
