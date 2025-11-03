@@ -1,4 +1,8 @@
+
 # Lecture Navigator Server (VidSeek API)
+
+Lecture Navigator Server (VidSeek API)
+
 
 FastAPI service for ingesting YouTube video transcripts and enabling semantic search with a Retrieval-Augmented Generation (RAG) pipeline. The app uses LlamaIndex for ingestion (chunking + embedding), MongoDB Atlas Vector Search for storage/retrieval, and Gemini as the LLM for answer synthesis. Structured JSON logs are emitted via Loguru with a per-request request_id.
 
@@ -145,4 +149,19 @@ Response (example):
 ## Notes
 - The default embedding model is small and CPU-friendly. You can switch to another HuggingFace model by setting EMBEDDING_MODEL_NAME.
 - OPENROUTER_API_KEY is present for future routing but not required in this build.
+
+<<<<<<< HEAD
+=======
+| Method | Endpoint                            | Description                                                                    |
+| :----- | :---------------------------------- | :----------------------------------------------------------------------------- |
+| `POST` | `/api/ingest_video`                 | Ingests a YouTube video from a URL, processes it, and stores the embeddings.     |
+| `POST` | `/api/ingest_file`                  | Ingests a local `.srt` transcript file.                                        |
+| `POST` | `/api/search_timestamps`            | Performs a hybrid search for a query within a previously ingested video.         |
+| `POST` | `/api/qa_youtube`                   | A one-shot endpoint to get a Q\&A response directly from a YouTube URL.         |
+| `POST` | `/api/qa_video`                     | Asks a question about an already-ingested video using its unique `video_id`.       |
+| `GET`  | `/api/videos`                       | Lists the metadata of up to 100 recently ingested videos.                        |
+| `POST` | `/api/transcribe_youtube`           | Fetches and returns the transcript for a YouTube video without indexing it.      |
+| `POST` | `/api/admin/purge_video/{video_id}` | **Admin**: Deletes all data associated with a specific `video_id`.             |
+| `POST` | `/api/admin/reembed_video/{video_id}` | **Admin**: Re-generates embeddings for a video using current model settings. |
+| `GET`  | `/health`                           | A simple health check endpoint.                                                |
 
